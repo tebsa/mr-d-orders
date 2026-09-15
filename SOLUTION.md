@@ -74,45 +74,41 @@ Responsible for:
 
 ---
 
-# 4. Order Flow
+# 4. Architecture
 
-The order creation flow is:
+The solution consists of three logical components:
 
-    Client
-       |
-       v
-    POST /orders
-       |
-       v
-    Validate request
-       |
-       v
-    Check order_ref
-       |
-       v
-    Read product prices
-       |
-       v
-    Calculate total
-       |
-       v
-    BEGIN TRANSACTION
-       |
-       +--> orders
-       |
-       +--> order_items
-       |
-       +--> stock_events
-       |
-       +--> order_events
-       |
-       v
-    COMMIT
-       |
-       v
-    Return order
+### Orders API
 
-The order, order items, stock events and integration event are committed together.
+The Orders API is responsible for receiving order requests, validating the input, calculating the order total, and persisting the order-related data.
+
+When an order is accepted, the API creates the order, its items, the corresponding stock event, and the `ORDER_ACCEPTED` integration event within the same database transaction.
+
+### Stock Worker
+
+The Stock Worker processes pending records from `stock_events`. It runs independently of the Orders API and updates product stock when events are available.
+
+Keeping stock processing separate allows the order API to continue accepting orders when the worker is temporarily unavailable.
+
+### Order Events Consumer
+
+The Order Events Consumer reads `ORDER_ACCEPTED` events from the `order_events` table.
+
+It represents a simple integration surface that could be replaced by a message broker or another event delivery mechanism in a larger production system.
+
+### PostgreSQL
+
+PostgreSQL is the durable source of truth for the application.
+
+It stores:
+
+- Products and current stock
+- Orders
+- Order items
+- Pending stock events
+- Accepted-order integration events
+
+The database also provides the transaction and constraint mechanisms used to maintain consistency and prevent duplicate orders.
 
 ---
 
@@ -239,31 +235,32 @@ This separates order acceptance from stock event processing.
 
 # 9. Temporary Stock Interruption
 
-A temporary stock interruption is handled by keeping the stock event in PostgreSQL.
+The Stock Worker is deliberately separated from the Orders API so that temporary stock-processing failures do not prevent an order from being persisted.
 
-For example:
+During an interruption, the following system behaviour is expected:
 
-    Order accepted
-          |
-          v
-    stock event persisted
-          |
-          X
-    Stock Worker unavailable
-          |
-          |
-          v
-    Event remains pending
-          |
-          v
-    Worker restarted
-          |
-          v
-    Event processed
+| System state | Order processing | Stock processing |
+|---|---|---|
+| Worker available | Orders are accepted and stock events are created | Pending events are processed |
+| Worker unavailable | Orders continue to be persisted | Pending events remain in PostgreSQL |
+| Worker restarted | Previously persisted orders remain unchanged | Pending events are processed |
+| Processing completed | Orders remain persisted | Corresponding stock events are marked as applied |
 
-Because the event is stored in PostgreSQL, stopping the worker does not lose the work.
+The important part of this design is that the stock event is persisted before the order transaction commits. The worker does not need to be available at the time the order is submitted.
 
-This satisfies the requirement that orders can still be accepted during a brief interruption and that stock catches up after recovery.
+When the worker becomes available again, it queries PostgreSQL for unapplied stock events and processes them. This provides the required catch-up behaviour without requiring the order to be submitted again.
+
+The interruption can be demonstrated locally by stopping the worker:
+
+    docker compose stop worker
+
+An order can then be submitted while the worker is stopped. The resulting stock event remains persisted in PostgreSQL.
+
+The worker can subsequently be restarted:
+
+    docker compose start worker
+
+The pending event is then available for processing.
 
 ---
 
@@ -288,17 +285,17 @@ Therefore, if processing fails before the transaction commits, the event remains
 
 ---
 
-# 11. Worker Restart Behaviour
+# 11. Event Consumer
 
-The worker does not depend on in-memory state to know which stock events still need processing.
+The event consumer polls the `order_events` table for events with an ID greater than the last event it has processed.
 
-Instead, it queries:
+Events are retrieved in ascending ID order.
 
-    applied = FALSE
+The consumer currently keeps its `last_event_id` in memory because the assignment only requires a small demonstration of the integration surface.
 
-When it starts again, it finds all pending events and processes them.
+This is intentionally a minimal implementation. In a production environment, the consumer checkpoint would normally be persisted so that the consumer could resume from its previous position after a restart.
 
-This makes the worker restart-safe for the assignment's failure scenario.
+The current consumer therefore demonstrates the integration contract without introducing additional infrastructure such as Kafka.
 
 ---
 
@@ -643,7 +640,6 @@ The following areas were reviewed and determined as part of the solution design:
 - Stock processing approach
 - Failure scenarios
 - Testing strategy
-- Technology choices
 
 Generated suggestions were reviewed and adapted before being incorporated into the project.
 
@@ -653,31 +649,35 @@ The final implementation was tested locally using Docker Compose and pytest.
 
 # 26. Final Design Summary
 
-The solution uses a simple durable workflow:
+The solution is designed around a small number of reliability and consistency principles.
 
-    POST /orders
-         |
-         v
-    PostgreSQL transaction
-         |
-         +---- orders
-         |
-         +---- order_items
-         |
-         +---- stock_events
-         |
-         +---- order_events
-         |
-         v
-       COMMIT
-         |
-         +--------------------+
-         |                    |
-         v                    v
-    Stock Worker       Events Consumer
-         |
-         v
-    products.stock
+### Durable persistence
+
+PostgreSQL is the source of truth for orders, order items, products, stock events, and order events. Important application state is therefore not dependent on in-memory data.
+
+### Idempotent order submission
+
+The `order_ref` is used as the primary key for orders. This provides database-level protection against duplicate submissions and ensures that the same order is not created more than once.
+
+### Transactional order creation
+
+Order data, stock events, and the `ORDER_ACCEPTED` integration event are created within the same database transaction. The transaction either commits the complete set of related records or rolls back.
+
+### Asynchronous stock processing
+
+Stock changes are represented as durable pending events and processed independently by the Stock Worker. This allows order acceptance to continue when the worker is temporarily unavailable.
+
+### Recovery after interruption
+
+Pending stock events remain in PostgreSQL while the Stock Worker is unavailable. When the worker is restarted, it processes the outstanding events and marks them as applied after successful processing.
+
+### Simple integration surface
+
+The `order_events` table provides a lightweight integration mechanism for accepted orders. A separate consumer demonstrates how another component can consume these events without introducing additional infrastructure.
+
+### Focused implementation
+
+The solution intentionally uses PostgreSQL, a small background worker, and a simple event consumer rather than introducing additional infrastructure such as Kafka or Kubernetes. This keeps the implementation focused on the reliability requirements of the assignment while leaving clear paths for future evolution.
 
 The key reliability decisions are:
 
