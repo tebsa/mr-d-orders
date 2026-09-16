@@ -3,7 +3,7 @@ import time
 import requests
 
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = "http://api:8000"
 
 
 def seed_products():
